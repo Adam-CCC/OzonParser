@@ -1,0 +1,24 @@
+{
+  "telegram": {
+    "bot_token": "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER",
+    "chat_id": "ВСТАВЬ_СЮДА_СВОЙ_CHAT_ID"
+  },
+
+  "poll_interval_minutes": 5,
+  "headless": false,
+
+  "default_threshold_percent": 20,
+
+  "items": [
+    {
+      "name": "Пример товара",
+      "article": "123456789",
+      "url": null,
+      "threshold_percent": null,
+      "target_price": null
+    }
+  ],
+
+  "state_file": "state.json",
+  "debug_dir": "debug"
+}
