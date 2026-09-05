@@ -275,6 +275,45 @@ def extract_article_from_input(raw: str) -> str:
 
 
 CHECK_INTERVAL_SECONDS = 120  # 2 минуты
+ARTICLES_FILE_DEFAULT = "articles.txt"
+
+
+def load_articles(filepath: str) -> list:
+    """
+    Читает список артикулов из текстового файла — по одному на строку.
+    Пустые строки и строки, начинающиеся с '#', пропускаются.
+    Допускаются как чистые артикулы, так и полные ссылки на товар.
+    """
+    from pathlib import Path
+
+    path = Path(filepath)
+
+    if not path.exists():
+        path.write_text(
+            "# Список артикулов Ozon для мониторинга — по одному на строку.\n"
+            "# Строки, начинающиеся с '#', игнорируются.\n"
+            "# Можно вставлять как чистый артикул, так и полную ссылку на товар.\n"
+            "#\n"
+            "# Пример:\n"
+            "# 123456789\n"
+            "# https://www.ozon.ru/product/nazvanie-tovara-987654321/\n",
+            encoding="utf-8",
+        )
+        logger.warning(f"Файл {filepath} не найден — создан пустой шаблон. Заполни его артикулами и перезапусти программу.")
+        return []
+
+    articles = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        article = extract_article_from_input(line)
+        if article.isdigit():
+            articles.append(article)
+        else:
+            logger.warning(f"Пропущена некорректная строка в {filepath}: '{raw_line}'")
+
+    return articles
 
 
 def print_result(result: Dict) -> None:
@@ -291,33 +330,55 @@ def print_result(result: Dict) -> None:
         if result["original_price"] and result["original_price"] != result["price"]:
             print(f"   Старая цена: {result['original_price']} ₽")
     else:
-        print(f"❌ Не удалось получить цену: {result['error']}")
+        print(f"❌ Артикул {result['article']}: не удалось получить цену — {result['error']}")
 
 
-def monitor_price(article: str, interval_seconds: int = CHECK_INTERVAL_SECONDS) -> None:
-    """Бесконечно проверяет цену товара с заданным интервалом, пока не остановят (Ctrl+C)."""
-    print(f"🔁 Запущен мониторинг артикула {article}. Проверка каждые {interval_seconds // 60} мин.")
+def monitor_articles(filepath: str, interval_seconds: int = CHECK_INTERVAL_SECONDS) -> None:
+    """
+    Бесконечно обходит список артикулов из файла.
+    Пауза interval_seconds делается один раз — после того, как пройден весь список
+    (то есть после получения данных по последнему артикулу), а не после каждого артикула.
+    Список перечитывается из файла в начале каждого круга — можно дописывать
+    артикулы, не перезапуская программу.
+    """
+    last_prices: Dict[str, int] = {}
+
+    print(f"🔁 Мониторинг запущен. Файл со списком артикулов: {filepath}")
+    print(f"   Пауза между кругами: {interval_seconds // 60} мин (отсчёт — после последнего артикула в списке).")
     print("   Останови программу сочетанием Ctrl+C, когда будет нужно.\n")
 
-    last_price: Optional[int] = None
-
     while True:
+        articles = load_articles(filepath)
+
+        if not articles:
+            print(f"⚠️ Список артикулов пуст. Заполни {filepath} и жди — файл перечитывается каждый круг.")
+        else:
+            print(f"📋 В этом круге будет проверено артикулов: {len(articles)}")
+
+            for index, article in enumerate(articles, start=1):
+                try:
+                    result = get_price_by_article(article)
+                    print_result(result)
+
+                    if result["success"]:
+                        previous_price = last_prices.get(article)
+                        if previous_price is not None and result["price"] != previous_price:
+                            diff = result["price"] - previous_price
+                            arrow = "📈" if diff > 0 else "📉"
+                            print(f"   {arrow} Цена изменилась: {previous_price} ₽ → {result['price']} ₽ ({diff:+} ₽)")
+                        last_prices[article] = result["price"]
+
+                except Exception as e:
+                    logger.error(f"Неожиданная ошибка при проверке артикула {article}: {e}")
+
+                is_last_in_cycle = index == len(articles)
+                if not is_last_in_cycle:
+                    # Между артикулами внутри одного круга небольшая техническая пауза,
+                    # чтобы не долбить сайт запросами впритык друг к другу
+                    time.sleep(3)
+
         try:
-            result = get_price_by_article(article)
-            print_result(result)
-
-            if result["success"]:
-                if last_price is not None and result["price"] != last_price:
-                    diff = result["price"] - last_price
-                    arrow = "📈" if diff > 0 else "📉"
-                    print(f"   {arrow} Цена изменилась: {last_price} ₽ → {result['price']} ₽ ({diff:+} ₽)")
-                last_price = result["price"]
-
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка при проверке цены: {e}")
-
-        try:
-            print(f"⏳ Следующая проверка через {interval_seconds // 60} мин...")
+            print(f"\n⏳ Круг завершён. Следующий круг через {interval_seconds // 60} мин...")
             time.sleep(interval_seconds)
         except KeyboardInterrupt:
             print("\n🛑 Мониторинг остановлен пользователем.")
@@ -325,19 +386,10 @@ def monitor_price(article: str, interval_seconds: int = CHECK_INTERVAL_SECONDS) 
 
 
 def main():
-    if len(sys.argv) > 1:
-        raw_input_value = sys.argv[1]
-    else:
-        raw_input_value = input("Введите артикул товара Ozon (или ссылку на товар): ").strip()
-
-    article = extract_article_from_input(raw_input_value)
-
-    if not article.isdigit():
-        print(f"❌ Некорректный артикул: {raw_input_value}")
-        sys.exit(1)
+    filepath = sys.argv[1] if len(sys.argv) > 1 else ARTICLES_FILE_DEFAULT
 
     try:
-        monitor_price(article)
+        monitor_articles(filepath)
     except KeyboardInterrupt:
         print("\n🛑 Мониторинг остановлен пользователем.")
 
