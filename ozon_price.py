@@ -16,10 +16,13 @@ Ozon Price Checker
 """
 
 import sys
+import os
+import csv
 import json
 import re
 import time
 import logging
+from pathlib import Path
 from typing import Optional, Dict
 
 from selenium import webdriver
@@ -41,6 +44,21 @@ BLOCKED_INDICATORS = [
     "access denied", "blocked", "ddos-guard", "проверка браузера",
     "доступ ограничен", "access restricted",
 ]
+
+# ANSI-коды для подсветки снижения цены ярко-зелёным в консоли
+COLOR_GREEN = "\033[92m"
+COLOR_RESET = "\033[0m"
+
+
+def enable_ansi_colors() -> None:
+    """На Windows консоль по умолчанию может не понимать ANSI-коды цвета — включаем их принудительно."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass  # если не получилось — просто останемся без цвета, на работу это не влияет
 
 
 def create_driver(headless: bool = True) -> webdriver.Chrome:
@@ -276,6 +294,15 @@ def extract_article_from_input(raw: str) -> str:
 
 CHECK_INTERVAL_SECONDS = 120  # 2 минуты
 ARTICLES_FILE_DEFAULT = "articles.txt"
+PRICE_STATE_FILE_DEFAULT = "price_state.json"      # данные предыдущего цикла по каждому артикулу
+PRICE_DROPS_LOG_DEFAULT = "price_drops.csv"        # журнал всех зафиксированных снижений цены
+
+# Какие поля сравниваем между циклами и как подписываем их в консоли/логе
+PRICE_FIELDS = [
+    ("price", "Цена"),
+    ("card_price", "Цена по карте"),
+    ("original_price", "Старая цена"),
+]
 
 
 def load_articles(filepath: str) -> list:
@@ -284,8 +311,6 @@ def load_articles(filepath: str) -> list:
     Пустые строки и строки, начинающиеся с '#', пропускаются.
     Допускаются как чистые артикулы, так и полные ссылки на товар.
     """
-    from pathlib import Path
-
     path = Path(filepath)
 
     if not path.exists():
@@ -316,35 +341,126 @@ def load_articles(filepath: str) -> list:
     return articles
 
 
-def print_result(result: Dict) -> None:
-    """Печатает результат одной проверки с меткой времени."""
+def load_price_state(filepath: str) -> Dict[str, Dict]:
+    """Загружает сохранённые данные о ценах с предыдущего цикла (переживает даже перезапуск программы)."""
+    path = Path(filepath)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать файл состояния {filepath}: {e}. Начинаю с чистого состояния.")
+        return {}
+
+
+def save_price_state(filepath: str, state: Dict[str, Dict]) -> None:
+    """Сохраняет текущие данные о ценах, чтобы сравнивать с ними на следующем цикле."""
+    try:
+        Path(filepath).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось сохранить файл состояния {filepath}: {e}")
+
+
+def log_price_drop(
+    filepath: str, timestamp: str, article: str, name: str,
+    field_label: str, old_value: int, new_value: int,
+) -> None:
+    """Добавляет строку в отдельный CSV-файл со всеми зафиксированными снижениями цены."""
+    decrease = old_value - new_value
+    file_exists = Path(filepath).exists()
+
+    # utf-8-sig и разделитель ';' — чтобы файл сразу корректно открывался в Excel с кириллицей
+    with open(filepath, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        if not file_exists:
+            writer.writerow(["Дата и время", "Артикул", "Товар", "Показатель", "Было, ₽", "Стало, ₽", "Снижение, ₽"])
+        writer.writerow([timestamp, article, name, field_label, old_value, new_value, decrease])
+
+
+def process_and_print(
+    result: Dict, previous_data: Optional[Dict], drops_log_filepath: str,
+) -> Optional[Dict]:
+    """
+    Печатает результат проверки одного артикула, сравнивая его с данными предыдущего цикла.
+    Если по какому-то из показателей (цена / цена по карте / старая цена) произошло
+    снижение — строка подсвечивается ярко-зелёным и добавляется запись в CSV-журнал.
+
+    Возвращает данные для сохранения в состояние (None, если проверка не удалась).
+    """
     timestamp = time.strftime("%d.%m.%Y %H:%M:%S")
     print(f"\n[{timestamp}]")
 
-    if result["success"]:
-        print(f"✅ Товар: {result['name']}")
-        print(f"   Артикул: {result['article']}")
-        print(f"   Цена: {result['price']} ₽")
-        if result["card_price"]:
-            print(f"   Цена по карте Ozon: {result['card_price']} ₽")
-        if result["original_price"] and result["original_price"] != result["price"]:
-            print(f"   Старая цена: {result['original_price']} ₽")
-    else:
+    if not result["success"]:
         print(f"❌ Артикул {result['article']}: не удалось получить цену — {result['error']}")
+        return None
+
+    print(f"✅ Товар: {result['name']}")
+    print(f"   Артикул: {result['article']}")
+
+    any_decrease = False
+
+    for field_key, field_label in PRICE_FIELDS:
+        current_value = result[field_key]
+        if not current_value:
+            continue  # у товара может не быть, например, цены по карте
+
+        previous_value = previous_data.get(field_key) if previous_data else None
+        line = f"   {field_label}: {current_value} ₽"
+
+        if previous_value and current_value < previous_value:
+            decrease = previous_value - current_value
+            line = (
+                f"{COLOR_GREEN}   {field_label}: {current_value} ₽ "
+                f"(было {previous_value} ₽, снижение на {decrease} ₽) 📉{COLOR_RESET}"
+            )
+            any_decrease = True
+            log_price_drop(
+                drops_log_filepath, timestamp, result["article"], result["name"],
+                field_label, previous_value, current_value,
+            )
+        elif previous_value and current_value > previous_value:
+            increase = current_value - previous_value
+            line += f"  (было {previous_value} ₽, рост на {increase} ₽) 📈"
+
+        print(line)
+
+    if any_decrease:
+        print(f"{COLOR_GREEN}   🟢 Снижение цены зафиксировано в {drops_log_filepath}{COLOR_RESET}")
+
+    return {
+        "name": result["name"],
+        "price": result["price"],
+        "card_price": result["card_price"],
+        "original_price": result["original_price"],
+        "last_checked": timestamp,
+    }
 
 
-def monitor_articles(filepath: str, interval_seconds: int = CHECK_INTERVAL_SECONDS) -> None:
+def monitor_articles(
+    filepath: str,
+    interval_seconds: int = CHECK_INTERVAL_SECONDS,
+    state_filepath: str = PRICE_STATE_FILE_DEFAULT,
+    drops_log_filepath: str = PRICE_DROPS_LOG_DEFAULT,
+) -> None:
     """
     Бесконечно обходит список артикулов из файла.
     Пауза interval_seconds делается один раз — после того, как пройден весь список
     (то есть после получения данных по последнему артикулу), а не после каждого артикула.
     Список перечитывается из файла в начале каждого круга — можно дописывать
     артикулы, не перезапуская программу.
+
+    Данные предыдущего цикла (цена, цена по карте, старая цена) хранятся в state_filepath
+    и переживают даже перезапуск программы. Если по какому-то артикулу цена снизилась —
+    строка подсвечивается зелёным и запись добавляется в drops_log_filepath.
     """
-    last_prices: Dict[str, int] = {}
+    price_state = load_price_state(state_filepath)
 
     print(f"🔁 Мониторинг запущен. Файл со списком артикулов: {filepath}")
     print(f"   Пауза между кругами: {interval_seconds // 60} мин (отсчёт — после последнего артикула в списке).")
+    print(f"   Файл состояния: {state_filepath}")
+    print(f"   Журнал снижений цены: {drops_log_filepath}")
     print("   Останови программу сочетанием Ctrl+C, когда будет нужно.\n")
 
     while True:
@@ -358,15 +474,12 @@ def monitor_articles(filepath: str, interval_seconds: int = CHECK_INTERVAL_SECON
             for index, article in enumerate(articles, start=1):
                 try:
                     result = get_price_by_article(article)
-                    print_result(result)
+                    previous_data = price_state.get(article)
+                    current_data = process_and_print(result, previous_data, drops_log_filepath)
 
-                    if result["success"]:
-                        previous_price = last_prices.get(article)
-                        if previous_price is not None and result["price"] != previous_price:
-                            diff = result["price"] - previous_price
-                            arrow = "📈" if diff > 0 else "📉"
-                            print(f"   {arrow} Цена изменилась: {previous_price} ₽ → {result['price']} ₽ ({diff:+} ₽)")
-                        last_prices[article] = result["price"]
+                    if current_data is not None:
+                        price_state[article] = current_data
+                        save_price_state(state_filepath, price_state)
 
                 except Exception as e:
                     logger.error(f"Неожиданная ошибка при проверке артикула {article}: {e}")
@@ -386,6 +499,8 @@ def monitor_articles(filepath: str, interval_seconds: int = CHECK_INTERVAL_SECON
 
 
 def main():
+    enable_ansi_colors()
+
     filepath = sys.argv[1] if len(sys.argv) > 1 else ARTICLES_FILE_DEFAULT
 
     try:
