@@ -274,6 +274,56 @@ def extract_article_from_input(raw: str) -> str:
     return raw
 
 
+CHECK_INTERVAL_SECONDS = 120  # 2 минуты
+
+
+def print_result(result: Dict) -> None:
+    """Печатает результат одной проверки с меткой времени."""
+    timestamp = time.strftime("%d.%m.%Y %H:%M:%S")
+    print(f"\n[{timestamp}]")
+
+    if result["success"]:
+        print(f"✅ Товар: {result['name']}")
+        print(f"   Артикул: {result['article']}")
+        print(f"   Цена: {result['price']} ₽")
+        if result["card_price"]:
+            print(f"   Цена по карте Ozon: {result['card_price']} ₽")
+        if result["original_price"] and result["original_price"] != result["price"]:
+            print(f"   Старая цена: {result['original_price']} ₽")
+    else:
+        print(f"❌ Не удалось получить цену: {result['error']}")
+
+
+def monitor_price(article: str, interval_seconds: int = CHECK_INTERVAL_SECONDS) -> None:
+    """Бесконечно проверяет цену товара с заданным интервалом, пока не остановят (Ctrl+C)."""
+    print(f"🔁 Запущен мониторинг артикула {article}. Проверка каждые {interval_seconds // 60} мин.")
+    print("   Останови программу сочетанием Ctrl+C, когда будет нужно.\n")
+
+    last_price: Optional[int] = None
+
+    while True:
+        try:
+            result = get_price_by_article(article)
+            print_result(result)
+
+            if result["success"]:
+                if last_price is not None and result["price"] != last_price:
+                    diff = result["price"] - last_price
+                    arrow = "📈" if diff > 0 else "📉"
+                    print(f"   {arrow} Цена изменилась: {last_price} ₽ → {result['price']} ₽ ({diff:+} ₽)")
+                last_price = result["price"]
+
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при проверке цены: {e}")
+
+        try:
+            print(f"⏳ Следующая проверка через {interval_seconds // 60} мин...")
+            time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            print("\n🛑 Мониторинг остановлен пользователем.")
+            break
+
+
 def main():
     if len(sys.argv) > 1:
         raw_input_value = sys.argv[1]
@@ -286,21 +336,10 @@ def main():
         print(f"❌ Некорректный артикул: {raw_input_value}")
         sys.exit(1)
 
-    print(f"🔎 Получаю цену для артикула {article}...")
-    result = get_price_by_article(article)
-
-    print()
-    if result["success"]:
-        print(f"✅ Товар: {result['name']}")
-        print(f"   Артикул: {result['article']}")
-        print(f"   Цена: {result['price']} ₽")
-        if result["card_price"]:
-            print(f"   Цена по карте Ozon: {result['card_price']} ₽")
-        if result["original_price"] and result["original_price"] != result["price"]:
-            print(f"   Старая цена: {result['original_price']} ₽")
-    else:
-        print(f"❌ Не удалось получить цену: {result['error']}")
-        sys.exit(1)
+    try:
+        monitor_price(article)
+    except KeyboardInterrupt:
+        print("\n🛑 Мониторинг остановлен пользователем.")
 
 
 if __name__ == "__main__":
