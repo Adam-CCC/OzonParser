@@ -3,28 +3,34 @@
 """
 Ozon Price Checker
 ------------------
-Простая утилита: получает цену товара Ozon по его артикулу.
+Утилита: мониторит цены товаров Ozon по списку артикулов и при снижении цены
+отправляет уведомление в Telegram.
 
 Использование:
-    python ozon_price.py 123456789
-    python ozon_price.py            # спросит артикул интерактивно
+    python ozon_price.py
+    python ozon_price.py my_articles.txt
 
 Требования:
-    pip install selenium selenium-stealth
+    pip install selenium selenium-stealth requests
     Установленный Google Chrome (версия должна совпадать с chromedriver,
     Selenium 4.15+ обычно подтягивает драйвер автоматически).
+
+Файлы, которые программа создаёт и ведёт сама:
+    articles.txt          — список отслеживаемых артикулов (заполняется вручную)
+    price_state.json       — данные предыдущего цикла по каждому артикулу
+    telegram_config.txt    — токен бота и chat_id (нужно заполнить один раз)
 """
 
 import sys
 import os
-import csv
 import json
 import re
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import WebDriverException, TimeoutException
@@ -294,10 +300,12 @@ def extract_article_from_input(raw: str) -> str:
 
 CHECK_INTERVAL_SECONDS = 120  # 2 минуты
 ARTICLES_FILE_DEFAULT = "articles.txt"
-PRICE_STATE_FILE_DEFAULT = "price_state.json"      # данные предыдущего цикла по каждому артикулу
-PRICE_DROPS_LOG_DEFAULT = "price_drops.csv"        # журнал всех зафиксированных снижений цены
+PRICE_STATE_FILE_DEFAULT = "price_state.json"          # данные предыдущего цикла по каждому артикулу
+TELEGRAM_CONFIG_FILE_DEFAULT = "telegram_config.txt"    # токен бота и chat_id
 
-# Какие поля сравниваем между циклами и как подписываем их в консоли/логе
+PRODUCT_URL_TEMPLATE = "https://www.ozon.ru/product/{article}/"
+
+# Какие поля сравниваем между циклами и как подписываем их в консоли/сообщении
 PRICE_FIELDS = [
     ("price", "Цена"),
     ("card_price", "Цена по карте"),
@@ -363,29 +371,165 @@ def save_price_state(filepath: str, state: Dict[str, Dict]) -> None:
         logger.error(f"Не удалось сохранить файл состояния {filepath}: {e}")
 
 
-def log_price_drop(
-    filepath: str, timestamp: str, article: str, name: str,
-    field_label: str, old_value: int, new_value: int,
-) -> None:
-    """Добавляет строку в отдельный CSV-файл со всеми зафиксированными снижениями цены."""
-    decrease = old_value - new_value
-    file_exists = Path(filepath).exists()
+def verify_telegram_config(telegram_config: Dict[str, str]) -> bool:
+    """
+    Проверяет, что BOT_TOKEN и CHAT_ID введены верно:
+    1) спрашивает у Telegram данные о боте (getMe) — так проверяется токен;
+    2) отправляет тестовое сообщение на CHAT_ID — так проверяется id чата.
+    Печатает понятный результат проверки в консоль. Возвращает True, если всё в порядке.
+    """
+    bot_token = telegram_config["bot_token"]
+    chat_id = telegram_config["chat_id"]
 
-    # utf-8-sig и разделитель ';' — чтобы файл сразу корректно открывался в Excel с кириллицей
-    with open(filepath, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f, delimiter=";")
-        if not file_exists:
-            writer.writerow(["Дата и время", "Артикул", "Товар", "Показатель", "Было, ₽", "Стало, ₽", "Снижение, ₽"])
-        writer.writerow([timestamp, article, name, field_label, old_value, new_value, decrease])
+    print("🔍 Проверяю настройки Telegram...")
+
+    # Шаг 1: проверка токена бота
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{bot_token}/getMe", timeout=15)
+    except Exception as e:
+        print(f"❌ Не удалось связаться с Telegram API: {e}")
+        return False
+
+    if response.status_code == 401:
+        print("❌ BOT_TOKEN неверный — Telegram отвечает 'Unauthorized'. Проверь токен, скопированный от @BotFather.")
+        return False
+    if response.status_code != 200:
+        print(f"❌ Telegram вернул ошибку при проверке токена: {response.status_code} {response.text}")
+        return False
+
+    bot_info = response.json().get("result", {})
+    bot_username = bot_info.get("username", "неизвестно")
+    print(f"✅ Токен верный. Бот: @{bot_username}")
+
+    # Шаг 2: проверка chat_id — реальной отправкой тестового сообщения
+    test_message = (
+        "✅ Проверка связи.\n"
+        "Если ты видишь это сообщение — BOT_TOKEN и CHAT_ID указаны верно, "
+        "мониторинг цен Ozon запущен и уведомления будут приходить сюда."
+    )
+    send_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        send_response = requests.post(send_url, data={"chat_id": chat_id, "text": test_message}, timeout=15)
+    except Exception as e:
+        print(f"❌ Не удалось отправить тестовое сообщение: {e}")
+        return False
+
+    if send_response.status_code == 200:
+        print(f"✅ CHAT_ID верный. Тестовое сообщение отправлено — проверь Telegram.")
+        return True
+
+    error_description = send_response.json().get("description", send_response.text)
+    print(f"❌ CHAT_ID неверный или бот не может писать в этот чат: {error_description}")
+    print("   Убедись, что ты сначала написал боту любое сообщение (например 'привет'),")
+    print("   и что CHAT_ID скопирован правильно (обычно это просто число, у групп — со знаком минус).")
+    return False
+
+
+def load_telegram_config(filepath: str) -> Optional[Dict[str, str]]:
+    """
+    Читает токен бота и chat_id из простого текстового файла формата KEY=VALUE.
+    Если файла нет — создаёт шаблон с инструкцией и возвращает None
+    (уведомления в Telegram в этом случае просто не отправляются).
+    """
+    path = Path(filepath)
+
+    if not path.exists():
+        path.write_text(
+            "# Настройки Telegram-уведомлений о снижении цены.\n"
+            "# 1. Создай бота через @BotFather в Telegram, получи токен вида 123456:ABC-DEF...\n"
+            "# 2. Напиши своему боту любое сообщение (просто 'привет'), чтобы он тебя увидел.\n"
+            "# 3. Узнай свой chat_id — например, через бота @userinfobot (он пришлёт его в ответ на /start).\n"
+            "# 4. Впиши оба значения ниже без кавычек и перезапусти программу.\n"
+            "#\n"
+            "BOT_TOKEN=\n"
+            "CHAT_ID=\n",
+            encoding="utf-8",
+        )
+        logger.warning(
+            f"Файл {filepath} не найден — создан шаблон. Заполни BOT_TOKEN и CHAT_ID, "
+            f"иначе уведомления о снижении цены отправляться не будут."
+        )
+        return None
+
+    config: Dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        config[key.strip().upper()] = value.strip()
+
+    bot_token = config.get("BOT_TOKEN", "")
+    chat_id = config.get("CHAT_ID", "")
+
+    if not bot_token or not chat_id:
+        logger.warning(
+            f"В файле {filepath} не заполнены BOT_TOKEN и/или CHAT_ID — "
+            f"уведомления о снижении цены отправляться не будут."
+        )
+        return None
+
+    return {"bot_token": bot_token, "chat_id": chat_id}
+
+
+def send_telegram_message(telegram_config: Dict[str, str], text: str) -> bool:
+    """Отправляет текстовое сообщение в Telegram через Bot API. Возвращает True при успехе."""
+    url = f"https://api.telegram.org/bot{telegram_config['bot_token']}/sendMessage"
+    payload = {"chat_id": telegram_config["chat_id"], "text": text}
+
+    try:
+        response = requests.post(url, data=payload, timeout=15)
+        if response.status_code == 200:
+            return True
+        logger.warning(f"Telegram вернул ошибку {response.status_code}: {response.text}")
+        return False
+    except Exception as e:
+        logger.warning(f"Не удалось отправить сообщение в Telegram: {e}")
+        return False
+
+
+def build_info_lines(data: Dict) -> List[str]:
+    """Строит список строк 'Показатель: значение ₽' для всех заполненных ценовых полей."""
+    lines = []
+    for field_key, field_label in PRICE_FIELDS:
+        value = data.get(field_key)
+        if value:
+            lines.append(f"{field_label}: {value} ₽")
+    return lines
+
+
+def build_price_drop_message(
+    article: str, name: str, field_label: str,
+    old_value: int, new_value: int,
+    previous_data: Dict, current_data: Dict,
+) -> str:
+    """Формирует текст уведомления о снижении цены в запрошенном формате."""
+    decrease = old_value - new_value
+    percent = (decrease / old_value * 100) if old_value else 0
+    link = PRODUCT_URL_TEMPLATE.format(article=article)
+
+    lines = [
+        name,
+        f"{field_label} снизилась: {decrease} ₽ ({percent:.1f}%)",
+        link,
+        "",
+        "Было:",
+        *build_info_lines(previous_data),
+        "",
+        "Стало:",
+        *build_info_lines(current_data),
+    ]
+    return "\n".join(lines)
 
 
 def process_and_print(
-    result: Dict, previous_data: Optional[Dict], drops_log_filepath: str,
+    result: Dict, previous_data: Optional[Dict], telegram_config: Optional[Dict[str, str]],
 ) -> Optional[Dict]:
     """
     Печатает результат проверки одного артикула, сравнивая его с данными предыдущего цикла.
     Если по какому-то из показателей (цена / цена по карте / старая цена) произошло
-    снижение — строка подсвечивается ярко-зелёным и добавляется запись в CSV-журнал.
+    снижение — строка подсвечивается ярко-зелёным и в Telegram отправляется уведомление
+    с полным набором данных "было / стало".
 
     Возвращает данные для сохранения в состояние (None, если проверка не удалась).
     """
@@ -398,6 +542,14 @@ def process_and_print(
 
     print(f"✅ Товар: {result['name']}")
     print(f"   Артикул: {result['article']}")
+
+    current_data = {
+        "name": result["name"],
+        "price": result["price"],
+        "card_price": result["card_price"],
+        "original_price": result["original_price"],
+        "last_checked": timestamp,
+    }
 
     any_decrease = False
 
@@ -416,33 +568,35 @@ def process_and_print(
                 f"(было {previous_value} ₽, снижение на {decrease} ₽) 📉{COLOR_RESET}"
             )
             any_decrease = True
-            log_price_drop(
-                drops_log_filepath, timestamp, result["article"], result["name"],
-                field_label, previous_value, current_value,
+
+            message = build_price_drop_message(
+                result["article"], result["name"], field_label,
+                previous_value, current_value, previous_data, current_data,
             )
+
+            if telegram_config:
+                sent = send_telegram_message(telegram_config, message)
+                if sent:
+                    print(f"{COLOR_GREEN}   🟢 Уведомление о снижении цены отправлено в Telegram{COLOR_RESET}")
+                else:
+                    print(f"{COLOR_GREEN}   🟢 Снижение цены зафиксировано, но отправить в Telegram не удалось{COLOR_RESET}")
+            else:
+                print(f"{COLOR_GREEN}   🟢 Снижение цены зафиксировано (Telegram не настроен — см. telegram_config.txt){COLOR_RESET}")
+
         elif previous_value and current_value > previous_value:
             increase = current_value - previous_value
             line += f"  (было {previous_value} ₽, рост на {increase} ₽) 📈"
 
         print(line)
 
-    if any_decrease:
-        print(f"{COLOR_GREEN}   🟢 Снижение цены зафиксировано в {drops_log_filepath}{COLOR_RESET}")
-
-    return {
-        "name": result["name"],
-        "price": result["price"],
-        "card_price": result["card_price"],
-        "original_price": result["original_price"],
-        "last_checked": timestamp,
-    }
+    return current_data
 
 
 def monitor_articles(
     filepath: str,
     interval_seconds: int = CHECK_INTERVAL_SECONDS,
     state_filepath: str = PRICE_STATE_FILE_DEFAULT,
-    drops_log_filepath: str = PRICE_DROPS_LOG_DEFAULT,
+    telegram_config_filepath: str = TELEGRAM_CONFIG_FILE_DEFAULT,
 ) -> None:
     """
     Бесконечно обходит список артикулов из файла.
@@ -453,14 +607,24 @@ def monitor_articles(
 
     Данные предыдущего цикла (цена, цена по карте, старая цена) хранятся в state_filepath
     и переживают даже перезапуск программы. Если по какому-то артикулу цена снизилась —
-    строка подсвечивается зелёным и запись добавляется в drops_log_filepath.
+    строка подсвечивается зелёным и уведомление отправляется в Telegram (настройки — в
+    telegram_config_filepath).
     """
     price_state = load_price_state(state_filepath)
+    telegram_config = load_telegram_config(telegram_config_filepath)
+
+    if telegram_config:
+        if not verify_telegram_config(telegram_config):
+            print(
+                f"⚠️ Проверка Telegram не пройдена — исправь {telegram_config_filepath} и перезапусти программу.\n"
+                f"   Мониторинг цен продолжится, но уведомления отправляться не будут."
+            )
+            telegram_config = None
 
     print(f"🔁 Мониторинг запущен. Файл со списком артикулов: {filepath}")
     print(f"   Пауза между кругами: {interval_seconds // 60} мин (отсчёт — после последнего артикула в списке).")
     print(f"   Файл состояния: {state_filepath}")
-    print(f"   Журнал снижений цены: {drops_log_filepath}")
+    print(f"   Telegram-уведомления: {'включены' if telegram_config else 'отключены (см. ' + telegram_config_filepath + ')'}")
     print("   Останови программу сочетанием Ctrl+C, когда будет нужно.\n")
 
     while True:
@@ -475,7 +639,7 @@ def monitor_articles(
                 try:
                     result = get_price_by_article(article)
                     previous_data = price_state.get(article)
-                    current_data = process_and_print(result, previous_data, drops_log_filepath)
+                    current_data = process_and_print(result, previous_data, telegram_config)
 
                     if current_data is not None:
                         price_state[article] = current_data
