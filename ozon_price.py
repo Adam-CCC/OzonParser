@@ -461,12 +461,16 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def build_articles_page(articles: List[str], page: int) -> tuple:
+def build_articles_page(articles: List[str], page: int, price_state: Optional[Dict[str, Dict]] = None) -> tuple:
     """
-    Строит текст и inline-клавиатуру для одной "страницы" списка артикулов:
-    у каждого товара — кнопка удаления, снизу — навигация и добавление.
+    Строит текст и inline-клавиатуру для одной "страницы" списка артикулов.
+    Полные названия товаров (без обрезки) выводятся нумерованным списком в тексте
+    сообщения — там нет ограничений ширины экрана, в отличие от кнопок. Сами кнопки
+    удаления компактные — просто номер строки, чтобы не разъезжаться на телефоне.
     Возвращает (текст, клавиатура, номер_фактической_страницы).
     """
+    price_state = price_state or {}
+
     total_pages = max(1, (len(articles) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
 
@@ -474,14 +478,23 @@ def build_articles_page(articles: List[str], page: int) -> tuple:
     page_articles = articles[start:start + PAGE_SIZE]
 
     if articles:
-        text = f"📦 Управление артикулами (стр. {page + 1}/{total_pages}, всего {len(articles)})\n"
+        lines = [f"📦 Управление артикулами (стр. {page + 1}/{total_pages}, всего {len(articles)})\n"]
+        for i, article in enumerate(page_articles, start=1):
+            name = (price_state.get(article) or {}).get("name")
+            if name:
+                lines.append(f"{i}. {name} — {article}")
+            else:
+                lines.append(f"{i}. {article} (название появится после первой проверки)")
+        text = "\n".join(lines)
     else:
         text = "📦 Список артикулов пуст. Нажми «➕ Добавить», чтобы начать отслеживание."
 
-    rows = [
-        [InlineKeyboardButton(text=f"❌ {article}", callback_data=f"del:{article}:{page}")]
-        for article in page_articles
+    # Кнопки удаления собираем в один ряд по несколько штук, чтобы список не растягивался по вертикали
+    delete_buttons = [
+        InlineKeyboardButton(text=f"❌ {i}", callback_data=f"del:{article}:{page}")
+        for i, article in enumerate(page_articles, start=1)
     ]
+    rows = [delete_buttons[i:i + 4] for i in range(0, len(delete_buttons), 4)]
 
     nav_row = []
     if page > 0:
@@ -866,7 +879,8 @@ async def run_telegram_bot(telegram_config: Dict[str, str], articles_filepath: s
         """Отправляет (или обновляет, если message_id передан) страницу со списком артикулов. Возвращает id сообщения."""
         with articles_lock:
             articles = load_articles(articles_filepath)
-        text, keyboard, _ = build_articles_page(articles, page)
+        price_state = load_price_state(PRICE_STATE_FILE_DEFAULT)
+        text, keyboard, _ = build_articles_page(articles, page, price_state)
 
         if message_id:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
