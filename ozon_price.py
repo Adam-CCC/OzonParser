@@ -530,8 +530,13 @@ def migrate_legacy_articles_file(old_path: str = "articles.txt", new_path: str =
 PRICE_FIELDS = [
     ("price", "Цена"),
     ("card_price", "Цена по карте"),
-    ("original_price", "Старая цена"),
+    # Это зачёркнутая цена на сайте, а не цена предыдущей итерации.
+    ("original_price", "Цена до скидки"),
 ]
+
+# Для WB уведомляем только об изменении фактической цены продажи. Поле
+# original_price остаётся справочным и не участвует в сравнении итераций.
+WB_TRACKED_PRICE_FIELDS = {"price"}
 
 articles_lock = threading.Lock()
 monitoring_enabled = threading.Event()
@@ -858,7 +863,11 @@ def process_and_print(
         previous_value = previous_data.get(field_key) if previous_data else None
         line = f"   {field_label}: {current_value} ₽"
 
-        if previous_value and current_value < previous_value:
+        # На Wildberries «Цена до скидки» — маркетинговая зачёркнутая цена.
+        # С предыдущей итерацией сравниваем только реальную текущую цену.
+        track_change = mp_key != "wb" or field_key in WB_TRACKED_PRICE_FIELDS
+
+        if track_change and previous_value and current_value < previous_value:
             decrease = previous_value - current_value
             line = (
                 f"{COLOR_GREEN}   {field_label}: {current_value} ₽ "
@@ -878,7 +887,7 @@ def process_and_print(
                     if send_telegram_message(telegram_config["bot_token"], chat_id, message)
                 )
 
-        elif previous_value and current_value > previous_value:
+        elif track_change and previous_value and current_value > previous_value:
             increase = current_value - previous_value
             line += f"  (было {previous_value} ₽, рост на {increase} ₽) 📈"
 
