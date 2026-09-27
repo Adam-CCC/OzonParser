@@ -11,9 +11,15 @@ Ozon + Wildberries Price Checker
     python ozon_price.py
 
 Требования:
-    pip install selenium selenium-stealth requests aiogram
-    Установленный Google Chrome (версия должна совпадать с chromedriver,
-    Selenium 4.15+ обычно подтягивает драйвер автоматически).
+    pip install selenium selenium-stealth requests aiogram seleniumbase
+    Установленный Google Chrome (нужен только для Ozon; Selenium 4.15+
+    обычно подтягивает драйвер автоматически).
+
+    Wildberries проверяется без браузера — прямым запросом к внутреннему
+    API сайта (/__internal/u-card/cards/v4/detail). Для него нужны cookie
+    x_wbaas_token и заголовок deviceid. Токен берётся через seleniumbase
+    (uc-режим, без окна) при запуске и при ответе 498/403 — как в проекте
+    github.com/Duff89/wb_parse_search_phrase. Нужен: pip install seleniumbase
 
 Файлы, которые программа создаёт и ведёт сама:
     articles_ozon.txt      — список отслеживаемых артикулов Ozon
@@ -25,8 +31,11 @@ Ozon + Wildberries Price Checker
 import sys
 import os
 import json
+import base64
+import uuid
 import re
 import time
+import random
 import asyncio
 import threading
 import logging
@@ -36,6 +45,9 @@ from typing import Optional, Dict, List
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException, TimeoutException
 from selenium_stealth import stealth
 
@@ -54,6 +66,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("ozon_price")
+
+# seleniumbase (uc-режим) пишет в лог INFO-трейсбеки "KeyError: privateNetworkRequestPolicy",
+# когда его пакет mycdp старше, чем Chrome. На работу это не влияет — просто глушим шум.
+# (Лечится и обновлением: pip install -U mycdp)
+for _noisy in ("uc.connection", "seleniumbase", "websockets", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # Тот же внутренний JSON-эндпоинт, которым пользуется сам сайт для подгрузки данных
 API_URL_TEMPLATE = "https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/product/{article}&__rr=1"
@@ -304,34 +322,57 @@ def extract_article_from_input(raw: str) -> str:
     return raw
 
 
-# JSON-эндпоинт карточки товара Wildberries.
-# В отличие от поиска WB он принимает уже известные артикулы и поддерживает
-# несколько nmId в одном запросе.
-WB_API_URL = "https://card.wb.ru/cards/v4/detail"
-WB_DEST = -1257786
-WB_BATCH_SIZE = 50
+# ---------------------------------------------------------------------------
+# Wildberries: прямой запрос к внутреннему API сайта (без браузера)
+# ---------------------------------------------------------------------------
+# Это тот же запрос, который делает сам сайт при открытии карточки товара:
+#     https://www.wildberries.ru/__internal/u-card/cards/v4/detail?...&nm=<артикул>
+# Старый card.wb.ru закрыт (403). Новый эндпоинт пускает запрос, только если
+# есть cookie x_wbaas_token И заголовок `deviceid` (проверено: без deviceid —
+# 403, с ним — 200). Несколько артикулов можно запросить одним вызовом,
+# перечислив их в nm через ';'.
+#
+# Токен x_wbaas_token получаем так же, как в проекте wb_parse_search_phrase
+# (github.com/Duff89/wb_parse_search_phrase, get_token.py):
+#   1. открываем https://www.wildberries.ru/ через seleniumbase в режиме
+#      uc=True (undetected Chrome, без окна) — этот режим проходит антибот WB;
+#   2. забираем cookie x_wbaas_token через CDP (Network.getAllCookies);
+#   3. браузер закрываем, дальше работаем обычными HTTP-запросами.
+# deviceid — случайный идентификатор вида site_<32 hex>, генерируется сам.
+#
+# Свежий токен берётся при каждом запуске программы, а также автоматически,
+# если WB ответил 498/403 (токен протух или сменился IP — токен к нему привязан).
+#
+# Нужен пакет:  pip install seleniumbase
 
-WB_REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Origin": "https://www.wildberries.ru",
-    "Referer": "https://www.wildberries.ru/",
-}
+# Запасной токен — используется, только если браузер не смог получить новый.
+WB_X_WBAAS_TOKEN = ''
+WB_DEST = '-8234381'   # регион доставки — от него зависит цена
+WB_TOKEN_FILE = ".wbaas_token"
+WB_API_URL = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
+WB_HOME_URL = "https://www.wildberries.ru/"
+WB_PRICE_SOURCE = "api"  # метка в price_state.json: цена получена через API
+WB_BATCH_SIZE = 50     # сколько артикулов отправлять в одном запросе
+WB_TOKEN_ATTEMPTS = 6               # попыток найти cookie в браузере...
+WB_TOKEN_ATTEMPT_PAUSE = 5          # ...с паузой между ними (сек)
+WB_REFRESH_COOLDOWN_SECONDS = 300   # не обновлять токен чаще, чем раз в 5 минут
+WB_AUTH_FAIL_CODES = (401, 403, 498)
+# 4. Не бежать за новым токеном при первом же отказе: сначала пауза и повтор
+#    со старым токеном (отказ бывает разовым), и только потом — браузер.
+WB_AUTH_RETRY_DELAY_MIN = 30
+WB_AUTH_RETRY_DELAY_MAX = 60
+# Один и тот же User-Agent и для браузера, и для запросов — токен выдаётся под него.
+WB_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+)
 
-WB_SESSION = requests.Session()
-WB_SESSION.headers.update(WB_REQUEST_HEADERS)
-
-
-def _rubles(value) -> int:
-    """Безопасно переводит цену WB из копеек в рубли."""
-    try:
-        return int(round(int(value or 0) / 100))
-    except (TypeError, ValueError):
-        return 0
+try:
+    from seleniumbase import Driver as SBDriver
+    SELENIUMBASE_AVAILABLE = True
+except ImportError:
+    SBDriver = None
+    SELENIUMBASE_AVAILABLE = False
 
 
 def _wb_error(article: str, message: str) -> dict:
@@ -346,153 +387,319 @@ def _wb_error(article: str, message: str) -> dict:
     }
 
 
-def parse_wb_product_data(product: dict) -> dict:
-    """Извлекает товар и цену из ответа cards/v4/detail."""
-    article = str(product.get("id", ""))
-    name = product.get("name", "")
+def _decode_wbaas_token(token: str) -> dict:
+    """
+    Достаёт из токена IP, User-Agent и срок действия. Формат:
+    1.1000.<id>.<base64: ?|IP|UA|expires|...>.<подпись>
+    """
+    try:
+        payload = token.split(".")[3]
+        payload += "=" * (-len(payload) % 4)
+        parts = base64.b64decode(payload).decode("utf-8", "replace").split("|")
+        return {
+            "ip": parts[1] if len(parts) > 1 else "",
+            "user_agent": parts[2] if len(parts) > 2 else "",
+            "expires": int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0,
+        }
+    except Exception:
+        return {"ip": "", "user_agent": "", "expires": 0}
 
-    prices = []
-    for size in product.get("sizes") or []:
-        price_info = size.get("price") or {}
 
-        # В разных ответах WB встречаются обе схемы. В v4 итоговая цена —
-        # total, а при отсутствии total: стоимость товара + логистика.
-        raw_sale = price_info.get("total")
-        if not raw_sale:
-            raw_sale = (
-                int(price_info.get("product") or 0)
-                + int(price_info.get("logistics") or 0)
-            )
+def _generate_wb_device_id() -> str:
+    """Как в common_data.py референсного проекта: site_ + 32 hex-символа."""
+    return f"site_{uuid.uuid4().hex}"
 
-        sale_price = _rubles(raw_sale)
-        if sale_price:
-            prices.append((sale_price, _rubles(price_info.get("basic"))))
 
-    # Для товара с разными размерами отображаем минимальную доступную цену.
-    if prices:
-        sale_price, original_price = min(prices, key=lambda item: item[0])
-    else:
-        # Резерв для старой/упрощённой структуры ответа.
-        sale_price = _rubles(product.get("salePriceU"))
-        original_price = _rubles(product.get("priceU"))
-
-    if not sale_price:
-        return _wb_error(article, "У товара нет доступной цены")
-
+def _load_wb_auth() -> dict:
+    """Читает сохранённые токен и deviceid из .wbaas_token."""
+    data = {}
+    path = Path(WB_TOKEN_FILE)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"WB: не удалось прочитать {WB_TOKEN_FILE}: {e}")
     return {
-        "article": article,
-        "name": name,
-        "price": sale_price,
-        "card_price": 0,
-        "original_price": original_price if original_price != sale_price else 0,
-        "success": True,
-        "error": "",
+        "token": data.get("token") or WB_X_WBAAS_TOKEN,
+        "device_id": data.get("device_id") or _generate_wb_device_id(),
     }
 
 
-def _request_wb_batch(articles: list[str]) -> dict[str, dict]:
-    """
-    Выполняет один пакетный запрос WB. Артикулы передаются через ";".
-    """
-    max_attempts = 3
-    last_error = "Не удалось получить данные от WB API"
+def _save_wb_auth(token: str, device_id: str) -> None:
+    info = _decode_wbaas_token(token)
+    expires_at = info["expires"] * 1000 if info["expires"] else int((time.time() + 3 * 86400) * 1000)
+    data = {"token": token, "expires_at": expires_at, "device_id": device_id}
+    try:
+        Path(WB_TOKEN_FILE).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"WB: не удалось сохранить {WB_TOKEN_FILE}: {e}")
 
-    for attempt in range(max_attempts):
+
+_wb_session: Optional[requests.Session] = None
+_wb_last_refresh_at = 0.0
+
+
+def _build_wb_session(token: str, device_id: str) -> requests.Session:
+    # User-Agent должен совпадать с тем, под который выдан токен.
+    user_agent = _decode_wbaas_token(token)["user_agent"] or WB_USER_AGENT
+    s = requests.Session()
+    s.headers.update({
+        'accept': '*/*',
+        'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'deviceid': device_id,
+        'priority': 'u=1, i',
+        'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': user_agent,
+        'x-requested-with': 'XMLHttpRequest',
+        'x-spa-version': '14.26.3',
+        'x-userid': '0',
+    })
+    if token:
+        s.cookies.set('x_wbaas_token', token, domain='.wildberries.ru')
+    return s
+
+
+def _get_wb_session() -> requests.Session:
+    """
+    Одна HTTP-сессия на весь прогон программы. При первом обращении — как в
+    референсном проекте — сразу берём свежий токен через браузер; если не
+    вышло, пробуем сохранённый в .wbaas_token.
+    """
+    global _wb_session
+    if _wb_session is None:
+        if not _refresh_wb_token_via_browser():
+            auth = _load_wb_auth()
+            logger.warning("WB: использую сохранённый токен из .wbaas_token (может быть устаревшим).")
+            _wb_session = _build_wb_session(auth["token"], auth["device_id"])
+    return _wb_session
+
+
+def _get_token_seleniumbase(headless: bool) -> Optional[str]:
+    """Точная копия подхода get_token.py: uc-режим + cookie через CDP."""
+    driver = SBDriver(uc=True, headed=not headless, headless=headless, agent=WB_USER_AGENT)
+    try:
+        driver.open(WB_HOME_URL)
+        for _ in range(WB_TOKEN_ATTEMPTS):
+            cookies = driver.execute_cdp_cmd("Network.getAllCookies", {})
+            for cookie in cookies.get("cookies", []):
+                if cookie.get("name") == "x_wbaas_token" and cookie.get("value"):
+                    return cookie["value"]
+            time.sleep(WB_TOKEN_ATTEMPT_PAUSE)
+        return None
+    finally:
         try:
-            logger.info(
-                f"WB: запрос {len(articles)} товаров "
-                f"(попытка {attempt + 1}/{max_attempts})"
-            )
-            response = WB_SESSION.get(
-                WB_API_URL,
-                params={
-                    "appType": 1,
-                    "curr": "rub",
-                    "dest": WB_DEST,
-                    "spp": 30,
-                    "locale": "ru",
-                    "nm": ";".join(articles),
-                },
-                timeout=20,
-            )
+            driver.quit()
+        except Exception:
+            pass
 
-            if response.status_code == 429:
-                delay = 5 * (2 ** attempt)
-                logger.warning(f"WB ограничил запросы (HTTP 429). Пауза {delay} с.")
-                last_error = "WB временно ограничил частоту запросов (HTTP 429)"
-                time.sleep(delay)
-                continue
 
-            if response.status_code in (403, 498):
-                last_error = f"WB отклонил запрос (HTTP {response.status_code})"
-                logger.warning(last_error)
-                break
+def _get_token_plain_selenium() -> Optional[str]:
+    """Запасной вариант, если seleniumbase не установлен: обычный Chrome из create_driver."""
+    driver = create_driver(headless=True)
+    try:
+        driver.get(WB_HOME_URL)
+        for _ in range(WB_TOKEN_ATTEMPTS):
+            cookie = driver.get_cookie("x_wbaas_token")
+            if cookie and cookie.get("value"):
+                return cookie["value"]
+            time.sleep(WB_TOKEN_ATTEMPT_PAUSE)
+        return None
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
-            if response.status_code != 200:
-                last_error = f"WB вернул HTTP {response.status_code}"
-                logger.warning(last_error)
-                if response.status_code >= 500:
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                break
 
-            try:
-                data = response.json()
-            except ValueError:
-                last_error = "WB вернул ответ не в формате JSON"
-                logger.warning(last_error)
-                continue
+def _refresh_wb_token_via_browser() -> bool:
+    """
+    Получает свежий x_wbaas_token через браузер и пересоздаёт HTTP-сессию.
+    Возвращает True, если токен обновлён.
+    """
+    global _wb_session, _wb_last_refresh_at
+    if time.time() - _wb_last_refresh_at < WB_REFRESH_COOLDOWN_SECONDS:
+        return False
+    _wb_last_refresh_at = time.time()
 
-            # v4 обычно возвращает products в корне. Поддержка data.products
-            # оставлена, чтобы код не ломался на альтернативном ответе WB.
-            products = data.get("products") or (data.get("data") or {}).get("products") or []
-            results = {}
-            for product in products:
-                parsed = parse_wb_product_data(product)
-                if parsed["article"]:
-                    results[parsed["article"]] = parsed
+    logger.info("WB: получаю свежий токен через браузер...")
+    token = None
+    attempts = ([("seleniumbase uc без окна", lambda: _get_token_seleniumbase(headless=True)),
+                 ("seleniumbase uc с окном", lambda: _get_token_seleniumbase(headless=False))]
+                if SELENIUMBASE_AVAILABLE else
+                [("обычный selenium", _get_token_plain_selenium)])
+    if not SELENIUMBASE_AVAILABLE:
+        logger.warning("WB: seleniumbase не установлен (pip install seleniumbase) — "
+                       "пробую обычный selenium, он проходит антибот WB хуже.")
 
-            for article in articles:
-                results.setdefault(
-                    article,
-                    _wb_error(article, "Товар не найден или снят с продажи"),
-                )
-            return results
-
-        except requests.RequestException as e:
-            last_error = f"Ошибка соединения с WB: {e}"
-            logger.warning(f"{last_error} (попытка {attempt + 1})")
-            time.sleep(3 * (attempt + 1))
-        except (TypeError, ValueError) as e:
-            last_error = f"Неожиданная структура ответа WB: {e}"
-            logger.warning(last_error)
+    for label, fn in attempts:
+        try:
+            token = fn()
+        except Exception as e:
+            logger.warning(f"WB: ошибка браузера ({label}): {e}")
+            token = None
+        if token:
             break
+        logger.warning(f"WB: токен не получен ({label}).")
 
-    return {article: _wb_error(article, last_error) for article in articles}
+    if not token:
+        logger.warning("WB: не удалось получить токен через браузер.")
+        return False
+
+    device_id = _load_wb_auth()["device_id"]
+    _save_wb_auth(token, device_id)
+    _wb_session = _build_wb_session(token, device_id)
+    info = _decode_wbaas_token(token)
+    logger.info(f"WB: токен получен (IP {info['ip']}), сохранён в {WB_TOKEN_FILE}.")
+    return True
+
+
+def _parse_wb_product(p: dict) -> dict:
+    """
+    Цены в ответе — в копейках: price.product — цена со скидкой (то, что
+    видит покупатель), price.basic — зачёркнутая цена. У разных размеров цена
+    может отличаться, берём минимальную среди размеров в наличии.
+    """
+    article = str(p.get("id", ""))
+    sizes_with_price = [s for s in p.get("sizes", []) if s.get("price")]
+    if not sizes_with_price:
+        result = _wb_error(article, "Нет в наличии (у товара нет цены ни в одном размере)")
+        result["name"] = p.get("name", "")
+        return result
+
+    price = min(s["price"].get("product", 0) for s in sizes_with_price) // 100
+    original_price = max(s["price"].get("basic", 0) for s in sizes_with_price) // 100
+
+    brand = p.get("brand", "")
+    name = p.get("name", "")
+    full_name = f"{brand} / {name}" if brand else name
+
+    return {
+        "article": article,
+        "name": full_name,
+        "price": price,
+        "card_price": 0,
+        "original_price": original_price if original_price != price else 0,
+        "success": price > 0,
+        "error": "" if price > 0 else "WB вернул нулевую цену",
+    }
 
 
 def get_prices_batch_wb(articles: list[str]) -> dict[str, dict]:
-    """Получает все товары WB несколькими компактными пакетами."""
+    """
+    Получает цены WB для списка артикулов прямыми HTTP-запросами
+    (по WB_BATCH_SIZE артикулов за запрос). Возвращает {артикул: результат}.
+    """
     clean_articles = list(dict.fromkeys(str(a).strip() for a in articles if str(a).strip()))
-    results = {}
+    results: Dict[str, dict] = {}
+    if not clean_articles:
+        return results
+
+    session = _get_wb_session()
 
     for start in range(0, len(clean_articles), WB_BATCH_SIZE):
-        batch = clean_articles[start:start + WB_BATCH_SIZE]
-        results.update(_request_wb_batch(batch))
+        chunk = clean_articles[start:start + WB_BATCH_SIZE]
+        params = {
+            'appType': '1',
+            'curr': 'rub',
+            'dest': WB_DEST,
+            'spp': '30',
+            'hide_vflags': '4294967296',
+            'hide_dflags': '1048576',
+            'mtype': '257',
+            'lang': 'ru',
+            'ab_testing': 'false',
+            'nm': ';'.join(chunk),
+        }
+        headers = {'referer': WB_PRODUCT_URL_TEMPLATE.format(article=chunk[0])}
+
+        try:
+            response = session.get(WB_API_URL, params=params, headers=headers, timeout=20)
+            # 498/403 — токен протух или сменился IP. Сначала ждём и пробуем ещё раз
+            # со старым токеном; если снова отказ — обновляем токен через браузер.
+            if response.status_code in WB_AUTH_FAIL_CODES:
+                delay = random.randint(WB_AUTH_RETRY_DELAY_MIN, WB_AUTH_RETRY_DELAY_MAX)
+                logger.warning(f"WB: HTTP {response.status_code} — жду {delay} с и пробую ещё раз с тем же токеном.")
+                time.sleep(delay)
+                response = session.get(WB_API_URL, params=params, headers=headers, timeout=20)
+            if response.status_code in WB_AUTH_FAIL_CODES:
+                logger.warning(f"WB: снова HTTP {response.status_code} — токен недействителен, обновляю.")
+                if _refresh_wb_token_via_browser():
+                    session = _get_wb_session()
+                    response = session.get(WB_API_URL, params=params, headers=headers, timeout=20)
+        except requests.RequestException as e:
+            for a in chunk:
+                results[a] = _wb_error(a, f"Ошибка сети при запросе к WB: {e}")
+            continue
+
+        if response.status_code != 200:
+            if response.status_code in WB_AUTH_FAIL_CODES:
+                error = (f"WB ответил HTTP {response.status_code} — токен недействителен, "
+                         f"обновить его не удалось (или уже пробовали <5 мин назад) — см. лог выше")
+            elif response.status_code == 429:
+                error = "WB ответил HTTP 429 — слишком частые запросы, попробуем в следующем цикле"
+            else:
+                error = f"WB ответил HTTP {response.status_code}"
+            logger.warning(f"WB: {error}")
+            for a in chunk:
+                results[a] = _wb_error(a, error)
+            continue
+
+        try:
+            products = response.json().get("products", [])
+        except ValueError as e:
+            for a in chunk:
+                results[a] = _wb_error(a, f"Не удалось разобрать ответ WB: {e}")
+            continue
+
+        for p in products:
+            parsed = _parse_wb_product(p)
+            if parsed["article"] in chunk:
+                results[parsed["article"]] = parsed
+
+        for a in chunk:
+            if a not in results:
+                results[a] = _wb_error(a, "Товар не найден или снят с продажи")
+
         if start + WB_BATCH_SIZE < len(clean_articles):
-            time.sleep(2)
+            time.sleep(random.uniform(1.5, 3.0))
 
     return results
 
 
 def get_price_by_article_wb(article: str) -> dict:
-    """Совместимая функция-обертка для единичного запроса."""
+    """Проверка одного артикула WB вне общего цикла мониторинга."""
     article = str(article).strip()
     return get_prices_batch_wb([article]).get(
         article, _wb_error(article, "Ошибка получения данных")
     )
 
-CHECK_INTERVAL_SECONDS = 120  # 2 минуты
+
+CHECK_INTERVAL_SECONDS = 120  # базовый интервал (используется, если RANDOMIZE_INTERVAL = False)
+
+# --- «Человеческий» ритм проверок, чтобы не выглядеть для антибота как робот ---
+# 1. Случайный интервал между кругами вместо ровных 2 минут.
+RANDOMIZE_INTERVAL = True
+INTERVAL_MIN_SECONDS = 90
+INTERVAL_MAX_SECONDS = 180
+# 2. Ночью проверяем реже (часы по времени компьютера; начало включительно, конец — нет).
+NIGHT_START_HOUR = 1
+NIGHT_END_HOUR = 8
+NIGHT_INTERVAL_MIN_SECONDS = 600    # 10 минут
+NIGHT_INTERVAL_MAX_SECONDS = 900    # 15 минут
+# 3. Иногда длинная пауза, «человек отошёл». Шанс на каждом дневном круге.
+LONG_PAUSE_CHANCE = 0.15            # ~ раз в 6-7 кругов
+LONG_PAUSE_MIN_SECONDS = 300        # 5 минут
+LONG_PAUSE_MAX_SECONDS = 600        # 10 минут
+
+# Временные переключатели площадок. False — площадка пропускается в каждом круге
+# (артикулы в файле остаются, бот ими управлять может, просто проверка не идёт).
+OZON_ENABLED = False
+WB_ENABLED = True
 ARTICLES_FILE_OZON_DEFAULT = "articles_ozon.txt"
 ARTICLES_FILE_WB_DEFAULT = "articles_wb.txt"
 PRICE_STATE_FILE_DEFAULT = "price_state.json"
@@ -551,6 +758,21 @@ monitor_status: Dict = {
     "last_cycle_finished_at": None,
     "next_check_at": None,
 }
+
+
+def choose_next_interval() -> tuple:
+    """Возвращает (секунды до следующего круга, пояснение для консоли)."""
+    if not RANDOMIZE_INTERVAL:
+        return CHECK_INTERVAL_SECONDS, "фиксированный интервал"
+
+    hour = time.localtime().tm_hour
+    if NIGHT_START_HOUR <= hour < NIGHT_END_HOUR:
+        return random.randint(NIGHT_INTERVAL_MIN_SECONDS, NIGHT_INTERVAL_MAX_SECONDS), "ночной режим"
+
+    if random.random() < LONG_PAUSE_CHANCE:
+        return random.randint(LONG_PAUSE_MIN_SECONDS, LONG_PAUSE_MAX_SECONDS), "длинная пауза"
+
+    return random.randint(INTERVAL_MIN_SECONDS, INTERVAL_MAX_SECONDS), "обычный интервал"
 
 
 def load_articles(filepath: str) -> list:
@@ -905,74 +1127,94 @@ def monitor_articles(
 
     print("🔁 Мониторинг запущен.")
 
-    while True:
-        monitoring_enabled.wait()
+    try:
+        while True:
+            monitoring_enabled.wait()
 
-        # Последовательность намеренно фиксирована: сначала весь Ozon,
-        # затем весь Wildberries.
-        with articles_lock:
-            ozon_articles = load_articles(MARKETPLACES["ozon"]["articles_file"])
-            wb_articles = load_articles(MARKETPLACES["wb"]["articles_file"])
+            # Последовательность намеренно фиксирована: сначала весь Ozon,
+            # затем весь Wildberries.
+            with articles_lock:
+                ozon_articles = load_articles(MARKETPLACES["ozon"]["articles_file"]) if OZON_ENABLED else []
+                wb_articles = load_articles(MARKETPLACES["wb"]["articles_file"]) if WB_ENABLED else []
 
-        total_items = len(ozon_articles) + len(wb_articles)
-        if not total_items:
-            print("⚠️ Списки артикулов пусты.")
-        else:
-            with monitor_status_lock:
-                monitor_status["total_in_cycle"] = total_items
+            total_items = len(ozon_articles) + len(wb_articles)
+            if not total_items:
+                print("⚠️ Списки артикулов пусты.")
+            else:
+                with monitor_status_lock:
+                    monitor_status["total_in_cycle"] = total_items
 
-            def handle_result(mp_key: str, article: str, result: Dict) -> None:
-                mp = MARKETPLACES[mp_key]
-                state_key = f"{mp_key}:{article}"
-                try:
-                    previous_data = price_state.get(state_key)
-                    current_data = process_and_print(
-                        mp_key, mp["label"], mp["product_url_template"],
-                        result, previous_data, telegram_config,
-                    )
+                def handle_result(mp_key: str, article: str, result: Dict) -> None:
+                    mp = MARKETPLACES[mp_key]
+                    state_key = f"{mp_key}:{article}"
+                    try:
+                        previous_data = price_state.get(state_key)
+                        # Старые цены WB снимались со страницы в браузере (другой
+                        # регион -> другая цена). Не сравниваем с ними, иначе на
+                        # первом круге будут ложные «цена снизилась».
+                        if mp_key == "wb" and previous_data and previous_data.get("source") != WB_PRICE_SOURCE:
+                            previous_data = None
+                        current_data = process_and_print(
+                            mp_key, mp["label"], mp["product_url_template"],
+                            result, previous_data, telegram_config,
+                        )
 
-                    if current_data is not None:
-                        price_state[state_key] = current_data
-                        save_price_state(state_filepath, price_state)
-                except Exception as e:
-                    logger.error(f"Неожиданная ошибка при проверке {mp['label']}:{article}: {e}")
+                        if current_data is not None:
+                            if mp_key == "wb":
+                                current_data["source"] = WB_PRICE_SOURCE
+                            price_state[state_key] = current_data
+                            save_price_state(state_filepath, price_state)
+                    except Exception as e:
+                        logger.error(f"Неожиданная ошибка при проверке {mp['label']}:{article}: {e}")
 
-            # Ozon требует отдельного браузерного прохода для каждого артикула.
-            for article in ozon_articles:
-                if not monitoring_enabled.is_set():
-                    break
-                handle_result("ozon", article, get_price_by_article(article))
-                if article != ozon_articles[-1] or wb_articles:
-                    time.sleep(3)
-
-            # WB получает весь список пакетно, а затем результаты разбираются в
-            # том же порядке, в котором артикулы записаны в articles_wb.txt.
-            if monitoring_enabled.is_set() and wb_articles:
-                wb_results = get_prices_batch_wb(wb_articles)
-                for article in wb_articles:
+                # Ozon требует отдельного браузерного прохода для каждого артикула.
+                for article in ozon_articles:
                     if not monitoring_enabled.is_set():
                         break
-                    handle_result(
-                        "wb",
-                        article,
-                        wb_results.get(article, _wb_error(article, "WB не вернул товар")),
-                    )
+                    handle_result("ozon", article, get_price_by_article(article))
+                    if article != ozon_articles[-1] or wb_articles:
+                        time.sleep(3)
 
+                # WB: весь список одним-двумя прямыми HTTP-запросами (без браузера),
+                # дальше каждый товар обрабатывается так же, как Ozon:
+                # снижение цены -> зелёная строка в консоли + сообщение в Telegram.
+                if monitoring_enabled.is_set() and wb_articles:
+                    try:
+                        wb_results = get_prices_batch_wb(wb_articles)
+                    except Exception as e:
+                        logger.warning(f"WB: ошибка при получении цен: {e}")
+                        wb_results = {a: _wb_error(a, f"Ошибка при запросе к WB: {e}") for a in wb_articles}
+
+                    for article in wb_articles:
+                        if not monitoring_enabled.is_set():
+                            break
+                        handle_result(
+                            "wb",
+                            article,
+                            wb_results.get(article, _wb_error(article, "WB не вернул товар")),
+                        )
+
+                with monitor_status_lock:
+                    monitor_status["cycle_count"] += 1
+                    monitor_status["last_cycle_finished_at"] = time.time()
+
+            pause_seconds, pause_reason = choose_next_interval()
             with monitor_status_lock:
-                monitor_status["cycle_count"] += 1
-                monitor_status["last_cycle_finished_at"] = time.time()
-                monitor_status["next_check_at"] = time.time() + interval_seconds
+                monitor_status["next_check_at"] = time.time() + pause_seconds
+            next_at = time.strftime("%H:%M:%S", time.localtime(time.time() + pause_seconds))
+            print(f"\n⏳ Следующая проверка в {next_at} (через {pause_seconds // 60} мин "
+                  f"{pause_seconds % 60} с, {pause_reason})")
 
-        try:
-            sleep_remaining = interval_seconds
+            sleep_remaining = pause_seconds
             while sleep_remaining > 0:
                 if not monitoring_enabled.is_set():
                     break
                 chunk = min(1, sleep_remaining)
                 time.sleep(chunk)
                 sleep_remaining -= chunk
-        except KeyboardInterrupt:
-            break
+
+    except KeyboardInterrupt:
+        pass
 
 
 async def run_telegram_bot(telegram_config: Dict[str, object]) -> None:
@@ -1110,7 +1352,21 @@ async def run_telegram_bot(telegram_config: Dict[str, object]) -> None:
     await dp.start_polling(bot)
 
 
+SCRIPT_VERSION = "WB-api-v10 (seleniumbase-токен + случайный ритм проверок)"
+
+
 def main():
+    print(f"🔖 Запущена версия скрипта: {SCRIPT_VERSION}", flush=True)
+    print(f"🔖 Файл: {os.path.abspath(__file__)}", flush=True)
+    print(
+        f"🔖 seleniumbase (токен WB): {'установлен' if SELENIUMBASE_AVAILABLE else 'НЕ установлен — pip install seleniumbase'}",
+        flush=True,
+    )
+    print(
+        f"🔖 Площадки: Ozon {'ВКЛ' if OZON_ENABLED else 'выкл'}, WB {'ВКЛ' if WB_ENABLED else 'выкл'} "
+        f"(переключатели OZON_ENABLED / WB_ENABLED рядом с CHECK_INTERVAL_SECONDS)",
+        flush=True,
+    )
     enable_ansi_colors()
     migrate_legacy_articles_file()
 
