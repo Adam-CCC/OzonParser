@@ -224,6 +224,30 @@ def find_product_name(widget_states: Dict) -> str:
     return ""
 
 
+# Признаки того, что товар Ozon закончился (ищем в ключах и тексте виджетов ответа).
+OZON_OUT_OF_STOCK_MARKERS = [
+    "товар закончился", "нет в наличии", "закончился", "outofstock", "out_of_stock",
+    "сообщить о поступлении", "нет в продаже",
+]
+
+
+def ozon_is_out_of_stock(widget_states: Dict, price_widget: Optional[Dict]) -> bool:
+    """
+    True, если Ozon показывает, что товар закончился. Цена при этом может
+    оставаться в виджете webPrice (тогда у него isAvailable = false).
+    """
+    if price_widget is not None and price_widget.get("isAvailable") is False:
+        return True
+    for key, value in widget_states.items():
+        if "outofstock" in key.lower():
+            return True
+        if price_widget is None and isinstance(value, str):
+            low = value.lower()
+            if any(marker in low for marker in OZON_OUT_OF_STOCK_MARKERS):
+                return True
+    return False
+
+
 def extract_price_number(price_str: str) -> int:
     """Превращает строку вида '1 234 ₽' в число 1234."""
     if not price_str:
@@ -261,8 +285,12 @@ def get_price_by_article(article: str, headless: bool = True) -> Dict:
             widget_states = data.get("widgetStates", {})
 
             price_widget = find_price_widget(widget_states)
+            out_of_stock = ozon_is_out_of_stock(widget_states, price_widget)
             if not price_widget:
-                last_error = "В ответе не найден виджет с ценой (возможно, товар недоступен или снят с продажи)"
+                if out_of_stock:
+                    last_error = "Товар закончился (цены в ответе нет — покажем последнюю известную)"
+                else:
+                    last_error = "В ответе не найден виджет с ценой (возможно, товар недоступен или снят с продажи)"
                 logger.warning(last_error)
                 return {
                     "article": article,
@@ -271,6 +299,7 @@ def get_price_by_article(article: str, headless: bool = True) -> Dict:
                     "card_price": 0,
                     "original_price": 0,
                     "success": False,
+                    "out_of_stock": out_of_stock,
                     "error": last_error,
                 }
 
@@ -280,6 +309,7 @@ def get_price_by_article(article: str, headless: bool = True) -> Dict:
                 "price": extract_price_number(price_widget.get("price", "")),
                 "card_price": extract_price_number(price_widget.get("cardPrice", "")),
                 "original_price": extract_price_number(price_widget.get("originalPrice", "")),
+                "in_stock": not out_of_stock,
                 "success": True,
                 "error": "",
             }
@@ -565,18 +595,21 @@ def _parse_wb_product(p: dict) -> dict:
     может отличаться, берём минимальную среди размеров в наличии.
     """
     article = str(p.get("id", ""))
+    brand = p.get("brand", "")
+    name = p.get("name", "")
+    full_name = f"{brand} / {name}" if brand else name
+
     sizes_with_price = [s for s in p.get("sizes", []) if s.get("price")]
+    stock_qty = sum(st.get("qty", 0) for s in p.get("sizes", []) for st in s.get("stocks", []) or [])
     if not sizes_with_price:
-        result = _wb_error(article, "Нет в наличии (у товара нет цены ни в одном размере)")
-        result["name"] = p.get("name", "")
+        # Распроданный товар WB отдаёт без цены — покажем последнюю известную.
+        result = _wb_error(article, "Товар закончился (цены в ответе нет — покажем последнюю известную)")
+        result["name"] = full_name
+        result["out_of_stock"] = True
         return result
 
     price = min(s["price"].get("product", 0) for s in sizes_with_price) // 100
     original_price = max(s["price"].get("basic", 0) for s in sizes_with_price) // 100
-
-    brand = p.get("brand", "")
-    name = p.get("name", "")
-    full_name = f"{brand} / {name}" if brand else name
 
     return {
         "article": article,
@@ -584,6 +617,7 @@ def _parse_wb_product(p: dict) -> dict:
         "price": price,
         "card_price": 0,
         "original_price": original_price if original_price != price else 0,
+        "in_stock": stock_qty > 0,
         "success": price > 0,
         "error": "" if price > 0 else "WB вернул нулевую цену",
     }
@@ -698,7 +732,7 @@ LONG_PAUSE_MAX_SECONDS = 600        # 10 минут
 
 # Временные переключатели площадок. False — площадка пропускается в каждом круге
 # (артикулы в файле остаются, бот ими управлять может, просто проверка не идёт).
-OZON_ENABLED = False
+OZON_ENABLED = True
 WB_ENABLED = True
 ARTICLES_FILE_OZON_DEFAULT = "articles_ozon.txt"
 ARTICLES_FILE_WB_DEFAULT = "articles_wb.txt"
@@ -842,15 +876,88 @@ def remove_article_from_file(filepath: str, raw_value: str) -> tuple:
     return True, f"🗑 Артикул {article} убран из отслеживания."
 
 
+PRICES_BUTTON = "💰 Цены"
+TG_MESSAGE_LIMIT = 4000      # у Telegram лимит 4096 символов на сообщение
+PRICE_LIST_NAME_MAX = 60     # длинные названия обрезаем, чтобы список читался
+
+
 def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
     marketplace_row = [KeyboardButton(text=mp["menu_button"]) for mp in MARKETPLACES.values()]
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="▶️ Запустить"), KeyboardButton(text="⏸ Остановить")],
             marketplace_row,
+            [KeyboardButton(text=PRICES_BUTTON)],
         ],
         resize_keyboard=True,
     )
+
+
+def format_rub(value) -> str:
+    """93495 -> '93 495 ₽'."""
+    return f"{int(value):,}".replace(",", " ") + " ₽"
+
+
+def build_prices_messages(price_state: Dict[str, Dict], articles_by_mp: Dict[str, List[str]]) -> List[str]:
+    """
+    Список всех отслеживаемых артикулов Ozon и WB с последней ценой из
+    price_state.json. Если товар закончился — цена (последняя известная)
+    и пометка. Возвращает список сообщений (длинный список режется на части).
+    """
+    enabled = {"ozon": OZON_ENABLED, "wb": WB_ENABLED}
+    blocks: List[str] = ["💰 Актуальные цены"]
+
+    for mp_key, mp in MARKETPLACES.items():
+        articles = articles_by_mp.get(mp_key, [])
+        header = f"\n📦 {mp['label']} ({len(articles)})"
+        if not enabled.get(mp_key, True):
+            header += " — проверка сейчас выключена, цены могут быть старыми"
+        blocks.append(header)
+
+        if not articles:
+            blocks.append("   список пуст")
+            continue
+
+        for i, article in enumerate(articles, start=1):
+            data = price_state.get(f"{mp_key}:{article}") or {}
+            name = data.get("name") or "название появится после первой проверки"
+            if len(name) > PRICE_LIST_NAME_MAX:
+                name = name[:PRICE_LIST_NAME_MAX - 1].rstrip() + "…"
+
+            price = data.get("price")
+            in_stock = data.get("in_stock", True)
+
+            if price:
+                price_line = format_rub(price)
+                if data.get("card_price"):
+                    price_line += f" (по карте {format_rub(data['card_price'])})"
+            elif data:
+                price_line = "цена неизвестна"
+            else:
+                price_line = "ещё не проверялся"
+
+            if not in_stock:
+                price_line += " — ❌ товар закончился"
+                if price and data.get("price_stale"):
+                    price_line += " (последняя известная цена)"
+
+            checked = data.get("last_checked", "")
+            meta = f"арт. {article}" + (f" · проверено {checked[:16]}" if checked else "")
+            blocks.append(f"{i}. {name}\n   {price_line}\n   {meta}")
+
+    # Режем на сообщения по лимиту Telegram, не разрывая карточку товара.
+    messages: List[str] = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n{block}" if current else block
+        if len(candidate) > TG_MESSAGE_LIMIT and current:
+            messages.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        messages.append(current)
+    return messages
 
 
 def build_articles_page(
@@ -1074,8 +1181,12 @@ def process_and_print(
         "price": result["price"],
         "card_price": result["card_price"],
         "original_price": result["original_price"],
+        "in_stock": result.get("in_stock", True),
         "last_checked": timestamp,
     }
+    in_stock = current_data["in_stock"]
+    if not in_stock:
+        print("   ⚠️ Товар закончился (цена ниже — та, что показывает площадка)")
 
     for field_key, field_label in PRICE_FIELDS:
         current_value = result[field_key]
@@ -1102,7 +1213,8 @@ def process_and_print(
                 previous_value, current_value, previous_data, current_data,
             )
 
-            if telegram_config and telegram_config.get("chat_ids"):
+            # Если товара нет в наличии, «снижение» купить всё равно нельзя — не шлём.
+            if in_stock and telegram_config and telegram_config.get("chat_ids"):
                 chat_ids = telegram_config["chat_ids"]
                 sum(
                     1 for chat_id in chat_ids
@@ -1154,6 +1266,25 @@ def monitor_articles(
                         # первом круге будут ложные «цена снизилась».
                         if mp_key == "wb" and previous_data and previous_data.get("source") != WB_PRICE_SOURCE:
                             previous_data = None
+
+                        # Товар закончился и площадка не отдала цену: сохраняем
+                        # последнюю известную цену и помечаем «нет в наличии».
+                        if not result.get("success") and result.get("out_of_stock"):
+                            saved = dict(price_state.get(state_key) or {})
+                            saved["name"] = result.get("name") or saved.get("name", "")
+                            saved["in_stock"] = False
+                            saved["price_stale"] = True   # цена — с последней проверки, когда товар был
+                            saved["last_checked"] = time.strftime("%d.%m.%Y %H:%M:%S")
+                            if mp_key == "wb":
+                                saved["source"] = WB_PRICE_SOURCE
+                            price_state[state_key] = saved
+                            save_price_state(state_filepath, price_state)
+                            last_price = saved.get("price")
+                            print(f"\n[{saved['last_checked']}] [{mp['label']}]\n"
+                                  f"⚠️ {saved['name'] or article} ({article}): товар закончился, "
+                                  f"последняя известная цена: {f'{last_price} ₽' if last_price else 'неизвестна'}")
+                            return
+
                         current_data = process_and_print(
                             mp_key, mp["label"], mp["product_url_template"],
                             result, previous_data, telegram_config,
@@ -1327,9 +1458,11 @@ async def run_telegram_bot(telegram_config: Dict[str, object]) -> None:
             return
 
         menu_buttons = {mp["menu_button"] for mp in MARKETPLACES.values()}
-        if message.text in menu_buttons | {"▶️ Запустить", "⏸ Остановить"}:
+        if message.text in menu_buttons | {"▶️ Запустить", "⏸ Остановить", PRICES_BUTTON}:
             await state.clear()
-            if message.text in menu_buttons:
+            if message.text == PRICES_BUTTON:
+                await send_prices(message.chat.id)
+            elif message.text in menu_buttons:
                 mp_key = next(k for k, mp in MARKETPLACES.items() if mp["menu_button"] == message.text)
                 await render_articles_page(message.chat.id, None, mp_key, page=0)
             return
@@ -1343,6 +1476,25 @@ async def run_telegram_bot(telegram_config: Dict[str, object]) -> None:
         await message.answer(reply_text)
         await render_articles_page(data["list_chat_id"], data["list_message_id"], mp_key, page=0)
 
+    async def send_prices(chat_id: int) -> None:
+        with articles_lock:
+            articles_by_mp = {k: load_articles(mp["articles_file"]) for k, mp in MARKETPLACES.items()}
+        price_state = load_price_state(PRICE_STATE_FILE_DEFAULT)
+        for text in build_prices_messages(price_state, articles_by_mp):
+            await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+
+    @dp.message(F.text == PRICES_BUTTON)
+    async def btn_prices(message: Message):
+        if not is_authorized(message):
+            return
+        await send_prices(message.chat.id)
+
+    @dp.message(Command("prices"))
+    async def cmd_prices(message: Message):
+        if not is_authorized(message):
+            return
+        await send_prices(message.chat.id)
+
     @dp.message(Command("status"))
     async def cmd_status(message: Message):
         if not is_authorized(message):
@@ -1352,7 +1504,7 @@ async def run_telegram_bot(telegram_config: Dict[str, object]) -> None:
     await dp.start_polling(bot)
 
 
-SCRIPT_VERSION = "WB-api-v10 (seleniumbase-токен + случайный ритм проверок)"
+SCRIPT_VERSION = "WB-api-v11 (кнопка «Цены» + пометка «товар закончился»)"
 
 
 def main():
